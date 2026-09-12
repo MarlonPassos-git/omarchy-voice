@@ -1,0 +1,176 @@
++            return completion("", [tool()])
++        with mock.patch("omarchy_voice.planner._chat", side_effect=response), \
++             mock.patch.object(self.executor, "call") as execute:
++            self.planner.think("query", stop.is_set)
++        execute.assert_not_called()
++
++    def test_pending_action_stops_rest_of_tool_batch(self):
++        calls = [tool("omarchy_cli", '{"command":"system reboot"}'), tool(id="second")]
++        with mock.patch("omarchy_voice.planner._chat", return_value=completion("", calls)), \
++             mock.patch.object(self.executor, "_shell") as shell:
++            turn = self.planner.think("reboot then query")
++        self.assertIsNotNone(self.executor.pending)
++        self.assertEqual(len(turn.actions), 1)
++        shell.assert_not_called()
++
++    def test_invalid_arguments_and_unoffered_tools_are_not_executed(self):
++        for call in (tool(arguments="[]"), tool(arguments="not json"), tool(name="run_shell")):
++            with self.subTest(call=call), mock.patch("omarchy_voice.planner._chat", side_effect=[completion("", [call]), completion()]), \
++                 mock.patch.object(self.executor, "call") as execute:
++                self.planner.think("query")
++                execute.assert_not_called()
++
++    def test_original_policy_still_denies_shell_escalation(self):
++        cfg = local_config(allow_shell=True)
++        executor = Executor(cfg)
++        with mock.patch("omarchy_voice.planner._chat", side_effect=[
++            completion("", [tool("run_shell", '{"command":"sudo id"}')]), completion("Refused")]), \
++             mock.patch.object(executor, "_shell") as shell:
++            Planner(cfg, executor).think("do something")
++        self.assertTrue(any("DENIED" in line for line in executor.transcript))
++        shell.assert_not_called()
++
++    def test_malformed_response_is_an_error_not_success(self):
++        for data in ({}, {"choices": []}, completion(["not text"]), completion("", "not a list")):
++            with self.subTest(data=data), mock.patch("omarchy_voice.planner._chat", return_value=data):
++                self.assertTrue(self.planner.think("query").error)
++
++    def test_step_limit_does_not_claim_success(self):
++        self.planner.config.max_turns = 1
++        with mock.patch("omarchy_voice.planner._chat", return_value=completion("will do", [tool()])), \
++             mock.patch.object(self.executor, "call", return_value=Result(True, "[]")):
++            self.assertIn("Maximum", self.planner.think("query").error)
++
++
++class CaptureContracts(unittest.TestCase):
++    def setUp(self):
++        self.directory = tempfile.TemporaryDirectory()
++        self.addCleanup(self.directory.cleanup)
++        self.path = Path(self.directory.name)
++        self.cfg = local_config()
++
++    def test_voxtype_uses_per_recording_file_not_clipboard(self):
++        recording = capture.VoxtypeCapture(self.cfg, self.path)
++        with mock.patch.object(capture, "voxtype_state", return_value="idle"), \
++             mock.patch.object(capture, "voxtype_command") as command:
++            recording.start()
++        self.assertEqual(command.call_args.args[1:4], ("record", "start", "--output-file"))
++        self.assertEqual(Path(command.call_args.args[-1]).parent, self.path)
++
++    def test_voxtype_refuses_busy_and_never_cancels_unowned_recording(self):
++        recording = capture.VoxtypeCapture(self.cfg, self.path)
++        with mock.patch.object(capture, "voxtype_state", return_value="recording"), \
++             mock.patch.object(capture, "voxtype_command") as command:
++            with self.assertRaises(providers.ProviderError):
++                recording.start()
++            recording.cancel()
++        command.assert_not_called()
++
++    def test_finished_transcript_is_read_only_after_idle(self):
++        recording = capture.VoxtypeCapture(self.cfg, self.path)
++        recording.recording = True
++        recording.path.write_text("  abra o navegador  ")
++        with mock.patch.object(capture, "voxtype_command"), \
++             mock.patch.object(capture, "voxtype_state", side_effect=["transcribing", "idle"]), \
++             mock.patch.object(capture.time, "sleep"):
++            self.assertEqual(recording.finish(lambda: False), "abra o navegador")
++
++    def test_oversized_transcript_is_refused(self):
++        recording = capture.VoxtypeCapture(self.cfg, self.path)
++        recording.path.write_text("x" * (capture.TRANSCRIPT_LIMIT + 1))
++        with mock.patch.object(capture, "voxtype_command"), \
++             mock.patch.object(capture, "voxtype_state", return_value="idle"), self.assertRaises(providers.ProviderError):
++            recording.finish(lambda: False)
++
++    def test_voxtype_status_validates_schema(self):
++        for value in ('{"class":"idle"}', '{}', '{"class":[]}'):
++            with mock.patch.object(capture, "voxtype_command", return_value=value):
++                if value == '{"class":"idle"}':
++                    self.assertEqual(capture.voxtype_state(self.cfg), "idle")
++                else:
++                    with self.assertRaises(providers.ProviderError):
++                        capture.voxtype_state(self.cfg)
++
++    def test_multipart_has_audio_and_language(self):
++        body, content_type = capture.multipart_audio(replace(self.cfg, stt_language="pt"), b"WAV")
++        self.assertIn(b'name="file"; filename="speech.wav"', body)
++        self.assertIn(b"\r\npt\r\n", body)
++        self.assertIn(b"WAV", body)
++        self.assertIn("boundary=", content_type)
++
++    def test_transcription_api_is_explicit_and_bounded(self):
++        path = self.path / "audio.wav"
++        path.write_bytes(b"WAV")
++        cfg = replace(self.cfg, stt_provider="compatible", stt_base_url="http://localhost:8000/v1")
++        with mock.patch.dict(os.environ, {"OPENAI_API_KEY": "secret"}, clear=True), \
++             mock.patch.object(capture, "request_bytes", return_value=b'{"text":" Ola "}') as request:
++            self.assertEqual(capture.transcribe_api(cfg, path), "Ola")
++        self.assertNotIn("Authorization", request.call_args.args[2])
++        path.write_bytes(b"x" * (capture.CLIP_LIMIT + 1))
++        with self.assertRaises(providers.ProviderError):
++            capture.transcribe_api(cfg, path)
++
++    def test_cancelled_recording_is_not_uploaded(self):
++        recording = capture.ApiCapture(self.cfg, self.path)
++        recording.process = mock.Mock()
++        recording.process.poll.return_value = None
++        with mock.patch.object(capture, "stop_process"), mock.patch.object(capture, "transcribe_api") as upload:
++            self.assertEqual(recording.finish(lambda: True), "")
++        upload.assert_not_called()
++
++    def test_no_unknown_provider_fallback(self):
++        with self.assertRaises(providers.ProviderError):
++            capture.make_capture(replace(self.cfg, stt_provider="typo"), self.path)
++
++
++class SpeechContracts(unittest.TestCase):
++    def test_piper_model_path_and_no_traversal(self):
++        cfg = local_config(models_dir="/tmp/models")
++        self.assertEqual(speech.model_path(cfg), Path("/tmp/models/piper/pt_BR-faber-medium.onnx"))
++        with self.assertRaises(providers.ProviderError):
++            speech.model_path(replace(cfg, tts_voice="../../secret"))
++
++    def test_pcm_sample_rate_and_format_are_preserved(self):
++        with wave.open(io.BytesIO(speech.pcm_wav(b"\0\0" * 240, 24000)), "rb") as wav:
++            self.assertEqual((wav.getframerate(), wav.getsampwidth(), wav.getnchannels()), (24000, 2, 1))
++        with self.assertRaises(providers.ProviderError):
++            speech.pcm_wav(b"a", 24000)
++
++    def test_openai_and_elevenlabs_wire_contracts(self):
++        with mock.patch.dict(os.environ, {"OPENAI_API_KEY": "o", "ELEVENLABS_API_KEY": "e"}, clear=True), \
++             mock.patch.object(speech, "request_bytes", return_value=b"\0\0") as request:
++            speech.api_speech(local_config(tts_provider="openai", tts_voice="alloy"), "Ola")
++            self.assertEqual(json.loads(request.call_args.args[1])["response_format"], "wav")
++            self.assertEqual(request.call_args.args[2]["Authorization"], "Bearer o")
++            wav = speech.api_speech(local_config(tts_provider="elevenlabs", tts_voice="voice-id"), "Ola")
++            self.assertTrue(request.call_args.args[0].endswith("voice-id?output_format=pcm_24000"))
++            self.assertEqual(request.call_args.args[2]["xi-api-key"], "e")
++            self.assertTrue(wav.startswith(b"RIFF"))
++
++    def test_compatible_speech_requires_explicit_endpoint(self):
++        with self.assertRaises(providers.ProviderError):
++            speech.api_speech(local_config(tts_provider="compatible"), "Ola")
++
++    def test_none_mouth_never_loads_or_connects(self):
++        mouth = speech.Mouth(local_config())
++        with mock.patch.object(mouth.piper, "load") as load, mock.patch.object(speech, "api_speech") as api:
++            mouth.speak("Ola")
++        load.assert_not_called()
++        api.assert_not_called()
++
++    def test_worker_uses_one_loaded_voice_for_multiple_requests(self):
++        with tempfile.TemporaryDirectory() as directory:
++            messages = [json.dumps({"text": text, "output": str(Path(directory) / f"{i}.wav")})
++                        for i, text in enumerate(("Primeiro", "Segundo"))]
++            voice = mock.Mock()
++            def synthesize(text, wav):
++                wav.setnchannels(1); wav.setsampwidth(2); wav.setframerate(22050); wav.writeframes(b"\0\0")
++            voice.synthesize_wav.side_effect = synthesize
++            replies = []
++            serve(voice, messages, replies.append)
++            self.assertEqual(replies, [{"ok": True}, {"ok": True}])
++            self.assertEqual(voice.synthesize_wav.call_count, 2)
++
++    def test_worker_rejects_malformed_requests(self):
++        voice, replies = mock.Mock(), []
++        serve(voice, ['not json', '{"text":""}'], replies.append)

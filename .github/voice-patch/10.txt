@@ -1,0 +1,185 @@
++    @mock.patch("omarchy_voice.tools.shutil.which", return_value="/mock/bin/tool")
++    def test_a_sleeping_display_is_reported_not_captured(self, _which):
+         with mock.patch.object(self.executor, "_query_json",
+                                return_value=[{"name": "HDMI-A-1", "dpmsStatus": False}]), \
+              mock.patch("subprocess.run") as run:
+@@ -502,7 +504,8 @@ class SleepingScreenTests(unittest.TestCase):
+                 {"dpmsStatus": False}, {"dpmsStatus": True}]):
+             self.assertIsNone(self.executor._screen_unavailable())
+ 
+-    def test_clicking_a_sleeping_screen_is_refused(self):
++    @mock.patch("omarchy_voice.tools.shutil.which", return_value="/mock/bin/tool")
++    def test_clicking_a_sleeping_screen_is_refused(self, _which):
+         with mock.patch.object(self.executor, "_query_json", side_effect=lambda k: {
+                 "monitors": [{"focused": True, "x": 0, "y": 0, "width": 100,
+                               "height": 100, "dpmsStatus": False}]}[k]), \
+diff --git a/tests/test_pipeline_features.py b/tests/test_pipeline_features.py
+new file mode 100644
+index 0000000..3a327e6
+--- /dev/null
++++ b/tests/test_pipeline_features.py
+@@ -0,0 +1,638 @@
++"""Provider contract and lifecycle tests; no API keys, models or desktop required."""
++
++import copy
++import io
++import json
++import os
++import subprocess
++import tempfile
++import threading
++import time
++import tomllib
++import unittest
++import urllib.error
++import wave
++from dataclasses import replace
++from pathlib import Path
++from unittest import mock
++
++from omarchy_voice import capture, cli, config, models, pipeline, providers, setup, speech
++from omarchy_voice.config import Config
++from omarchy_voice.piper_worker import serve
++from omarchy_voice.planner import Planner, Turn
++from omarchy_voice.tools import Executor, Result
++
++
++def local_config(**kwargs):
++    return replace(Config(voice_mode="pipeline", brain_provider="ollama", brain_model="qwen3:4b"), **kwargs)
++
++
++def completion(content="Done", calls=None, **metadata):
++    return {"choices": [{"message": {"content": content, "tool_calls": calls or [], **metadata}}]}
++
++
++def tool(name="hypr_query", arguments='{"kind":"clients"}', id="call_1", **metadata):
++    return {"id": id, "type": "function", "function": {"name": name, "arguments": arguments}, **metadata}
++
++
++class ProviderContracts(unittest.TestCase):
++    def test_local_provider_does_not_inherit_cloud_credentials(self):
++        with mock.patch.dict(os.environ, {"OPENAI_API_KEY": "private"}, clear=True):
++            endpoint = providers.brain_endpoint(local_config())
++            self.assertEqual(endpoint.key_env, "")
++            self.assertEqual(providers.key_headers(endpoint.key_env, required=False), {})
++
++    def test_each_remote_preset_has_its_own_key(self):
++        for provider, env in (("openai", "OPENAI_API_KEY"), ("gemini", "GEMINI_API_KEY"),
++                              ("openrouter", "OPENROUTER_API_KEY")):
++            self.assertEqual(providers.brain_endpoint(Config(brain_provider=provider, brain_model="m")).key_env, env)
++
++    def test_custom_endpoint_cannot_inherit_openai_key(self):
++        endpoint = providers.brain_endpoint(Config(brain_base_url="https://example.org/v1"))
++        self.assertEqual(endpoint.key_env, "")
++
++    def test_non_openai_needs_explicit_model(self):
++        with self.assertRaises(providers.ProviderError):
++            providers.brain_endpoint(Config(brain_provider="gemini"))
++
++    def test_endpoint_validation(self):
++        for url in ("https://example.org/v1", "http://127.0.0.1:11434/v1", "http://[::1]:1234/v1"):
++            self.assertEqual(providers.checked_url(url), url)
++        for url in ("http://example.org", "https://user:pass@example.org", "https://a/b?api_key=secret",
++                    "file:///etc/passwd", "https://a/#fragment", "http://127.0.0.1.evil.test"):
++            with self.subTest(url=url), self.assertRaises(providers.ProviderError):
++                providers.checked_url(url)
++
++    def test_redirects_are_not_followed(self):
++        with self.assertRaises(providers.ProviderError):
++            providers.NoRedirect().redirect_request(None, None, 302, "", {}, "https://other.test")
++
++    def test_missing_credentials_and_newlines_rejected(self):
++        for value in ("", "abc\nInjected: header"):
++            with mock.patch.dict(os.environ, {"KEY": value}, clear=True), self.assertRaises(providers.ProviderError):
++                providers.key_headers("KEY")
++
++    def test_http_errors_do_not_leak_response_bodies(self):
++        error = urllib.error.HTTPError("https://a", 401, "unauthorized", {}, io.BytesIO(b"secret prompt"))
++        with mock.patch.object(providers.urllib.request, "build_opener") as opener:
++            opener.return_value.open.side_effect = error
++            with self.assertRaises(providers.ProviderError) as raised:
++                providers.request_bytes("https://a", b"request", {}, 1)
++        self.assertNotIn("secret", str(raised.exception))
++
++    def test_response_bytes_are_bounded(self):
++        with mock.patch.object(providers.urllib.request, "build_opener") as opener:
++            opener.return_value.open.return_value.__enter__.return_value.read.return_value = b"12345"
++            with self.assertRaises(providers.ProviderError):
++                providers.request_bytes("https://a", None, {}, 1, limit=4)
++
++    def test_json_contract_rejects_non_objects(self):
++        for result in (b"[]", b"bad json"):
++            with mock.patch.object(providers, "request_bytes", return_value=result), self.assertRaises(providers.ProviderError):
++                providers.request_json("https://a", None, {}, 1)
++
++    def test_compatible_wire_shape_and_explicit_key(self):
++        cfg = local_config(brain_provider="gemini", brain_model="selected-model")
++        with mock.patch.dict(os.environ, {"GEMINI_API_KEY": "google-key"}, clear=True), \
++             mock.patch.object(providers, "request_json", return_value=completion()) as request:
++            providers.chat_completion([], [], cfg)
++        url, body, headers, timeout = request.call_args.args
++        self.assertEqual(url, "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions")
++        self.assertEqual(body["model"], "selected-model")
++        self.assertEqual(headers["Authorization"], "Bearer google-key")
++        self.assertEqual(body["tool_choice"], "auto")
++
++    def test_extra_cannot_replace_safety_relevant_request_fields(self):
++        for provider in ("compatible", "ollama"):
++            cfg = local_config(brain_provider=provider, brain_base_url="http://localhost:1234/v1",
++                               brain_extra={"tools": []})
++            with self.assertRaises(providers.ProviderError):
++                providers.chat_completion([], [], cfg)
++
++    def test_ollama_roundtrip_keeps_thinking_and_converts_arguments(self):
++        messages = [{"role": "assistant", "content": "", "thinking": "opaque",
++                     "tool_calls": [tool()]}, {"role": "tool", "tool_call_id": "call_1", "content": "[]"}]
++        original = copy.deepcopy(messages)
++        output = providers.ollama_messages(messages)
++        self.assertEqual(messages, original)
++        self.assertEqual(output[0]["thinking"], "opaque")
++        self.assertEqual(output[0]["tool_calls"][0]["function"]["arguments"], {"kind": "clients"})
++        self.assertEqual(output[1]["tool_name"], "hypr_query")
++        response = {"message": {"role": "assistant", "content": "", "tool_calls": [
++            {"function": {"name": "hypr_query", "arguments": {"kind": "clients"}}}]},
++                    "prompt_eval_count": 20, "eval_count": 5}
++        with mock.patch.object(providers, "request_json", return_value=response) as request:
++            normalized = providers.chat_completion(messages, [], local_config())
++        self.assertTrue(request.call_args.args[0].endswith("/api/chat"))
++        self.assertEqual(request.call_args.args[1]["options"]["num_ctx"], 16384)
++        call = normalized["choices"][0]["message"]["tool_calls"][0]
++        self.assertIsInstance(call["function"]["arguments"], str)
++        self.assertTrue(call["id"])
++        self.assertEqual(normalized["usage"]["prompt_tokens"], 20)
++
++
++class PlannerContracts(unittest.TestCase):
++    def setUp(self):
++        self.prompt = mock.patch("omarchy_voice.planner._system_prompt", return_value="desktop tools")
++        self.prompt.start()
++        self.addCleanup(self.prompt.stop)
++        self.executor = Executor(local_config())
++        self.planner = Planner(local_config(), self.executor)
++
++    def test_opaque_gemini_metadata_survives_tool_round(self):
++        calls = [tool(extra_content={"google": {"thought_signature": "opaque"}})]
++        first = completion("", calls, extra_content={"signature": "keep"})
++        first["usage"] = {"prompt_tokens": 10, "completion_tokens": 2}
++        second = completion("Finished")
++        second["usage"] = {"prompt_tokens": 20, "completion_tokens": 3}
++        with mock.patch("omarchy_voice.planner._chat", side_effect=[first, second]) as request, \
++             mock.patch.object(self.executor, "call", return_value=Result(True, "[]")):
++            turn = self.planner.think("query")
++        self.assertEqual(turn.tokens, {"in": 30, "out": 5})
++        self.assertEqual(request.call_args.args[0][2]["extra_content"], {"signature": "keep"})
++        self.assertEqual(request.call_args.args[0][2]["tool_calls"], calls)
++
++    def test_cancel_before_request_never_calls_provider(self):
++        with mock.patch("omarchy_voice.planner._chat") as request:
++            turn = self.planner.think("query", lambda: True)
++        self.assertEqual(turn.reply, "Cancelled.")
++        request.assert_not_called()
++
++    def test_cancel_after_http_prevents_all_tool_execution(self):
++        stop = threading.Event()
++        def response(*_):
++            stop.set()

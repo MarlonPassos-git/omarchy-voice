@@ -1,0 +1,211 @@
++    "gemini": ("https://generativelanguage.googleapis.com/v1beta/openai", "GEMINI_API_KEY"),
++    "openrouter": ("https://openrouter.ai/api/v1", "OPENROUTER_API_KEY"),
++    "ollama": ("http://127.0.0.1:11434/v1", ""),
++    "lmstudio": ("http://127.0.0.1:1234/v1", ""),
++    "compatible": ("", ""),
++}
++JSON_LIMIT = 8 * 1024 * 1024
++AUDIO_LIMIT = 32 * 1024 * 1024
++
++
++class ProviderError(RuntimeError):
++    """An actionable provider failure, without response bodies or credentials."""
++
++
++def is_loopback(host: str | None) -> bool:
++    """Recognize literal loopback addresses without DNS, e.g. 127.0.0.1."""
++    if host == "localhost":
++        return True
++    try:
++        return ipaddress.ip_address(host or "").is_loopback
++    except ValueError:
++        return False
++
++
++def checked_url(url: str, *, allow_query: bool = False) -> str:
++    """Allow HTTPS or local HTTP; reject credentials and query-string secrets."""
++    parsed = urllib.parse.urlsplit(url)
++    if not parsed.hostname or parsed.username or parsed.password or (parsed.query and not allow_query) or parsed.fragment:
++        raise ProviderError("API URL must have a host and no credentials, query, or fragment")
++    if parsed.scheme != "https" and not (parsed.scheme == "http" and is_loopback(parsed.hostname)):
++        raise ProviderError("API URL must use HTTPS (HTTP is allowed only on loopback)")
++    return url.rstrip("/")
++
++
++class NoRedirect(urllib.request.HTTPRedirectHandler):
++    """Do not forward authorization headers to a redirect destination."""
++
++    def redirect_request(self, req, fp, code, msg, headers, newurl):
++        raise ProviderError(f"API redirected (HTTP {code}); configure its final URL explicitly")
++
++
++def request_bytes(url: str, body: bytes | None, headers: dict, timeout: float,
++                  limit: int = JSON_LIMIT) -> bytes:
++    """Make one bounded request; never retry a potentially billable operation."""
++    request = urllib.request.Request(checked_url(url, allow_query=True), data=body, headers=headers)
++    try:
++        # A system HTTP proxy must not silently turn loopback inference into remote traffic.
++        handlers = [NoRedirect()]
++        if is_loopback(urllib.parse.urlsplit(url).hostname):
++            handlers.append(urllib.request.ProxyHandler({}))
++        with urllib.request.build_opener(*handlers).open(request, timeout=timeout) as response:
++            data = response.read(limit + 1)
++    except urllib.error.HTTPError as exc:
++        # Provider bodies can echo prompts, audio metadata, or even credentials.
++        raise ProviderError(f"API HTTP {exc.code}; check endpoint, model, credentials and quota") from exc
++    except (urllib.error.URLError, TimeoutError, OSError) as exc:
++        raise ProviderError("API connection failed or timed out; check endpoint and network") from exc
++    if len(data) > limit:
++        raise ProviderError(f"API response exceeds the {limit}-byte limit")
++    return data
++
++
++def request_json(url: str, payload: dict | None, headers: dict, timeout: float) -> dict:
++    """Read a JSON object, e.g. request_json(url, payload, headers, 60)."""
++    data = None if payload is None else json.dumps(payload).encode()
++    result = request_bytes(url, data, {"Content-Type": "application/json", **headers}, timeout)
++    try:
++        decoded = json.loads(result)
++    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
++        raise ProviderError("API returned invalid JSON") from exc
++    if not isinstance(decoded, dict):
++        raise ProviderError("API response must be a JSON object")
++    return decoded
++
++
++def key_headers(env_name: str, *, required: bool = True, header: str = "Authorization") -> dict:
++    """Read only the chosen credential, e.g. key_headers('GEMINI_API_KEY')."""
++    key = os.environ.get(env_name, "") if env_name else ""
++    if required and not key:
++        raise ProviderError(f"{env_name or 'API key variable'} is not set; run omarchy-voice setup")
++    if not key:
++        return {}
++    if any(char in key for char in "\r\n"):
++        raise ProviderError("API key contains an invalid newline")
++    return {header: f"Bearer {key}" if header == "Authorization" else key}
++
++
++@dataclass(frozen=True)
++class BrainEndpoint:
++    base_url: str
++    model: str
++    key_env: str
++
++
++def brain_endpoint(config) -> BrainEndpoint:
++    """Resolve the text planner independently from the integrated voice model."""
++    if not isinstance(config.brain_provider, str) or config.brain_provider not in BRAIN_PRESETS:
++        raise ProviderError(f"unknown brain provider: {config.brain_provider!r}")
++    default_url, default_env = BRAIN_PRESETS[config.brain_provider]
++    base = checked_url(config.brain_base_url or default_url)
++    if config.brain_provider == "openai":
++        default_env = config.api_key_env  # preserve legacy custom key variables
++    if config.brain_base_url and base != default_url.rstrip("/"):
++        default_env = ""  # a custom destination requires explicit credential selection
++    key_env = config.brain_api_key_env or default_env
++    model = config.brain_model or (config.planner_model if config.brain_provider == "openai" else "")
++    if not isinstance(model, str) or not model.strip():
++        raise ProviderError("brain.model must not be empty")
++    return BrainEndpoint(base, model, key_env)
++
++
++def chat_completion(messages: list[dict], tools: list[dict], config) -> dict:
++    """Use the compatible tool-calling API, preserving provider metadata."""
++    endpoint = brain_endpoint(config)
++    if config.brain_provider == "ollama":
++        return ollama_completion(messages, tools, config, endpoint)
++    protected = {"model", "messages", "tools", "tool_choice", "stream"}
++    if protected.intersection(config.brain_extra):
++        raise ProviderError("brain.extra cannot override model, messages, tools, tool_choice or stream")
++    payload = {"model": endpoint.model, "messages": messages, "tools": tools,
++               "tool_choice": "auto", **config.brain_extra}
++    headers = key_headers(endpoint.key_env, required=bool(endpoint.key_env))
++    return request_json(endpoint.base_url + "/chat/completions", payload, headers, config.brain_timeout)
++
++
++def ollama_root(config) -> str:
++    """Use the same Ollama server for inference and explicit model management."""
++    endpoint = brain_endpoint(config)
++    return endpoint.base_url.removesuffix("/v1")
++
++
++def ollama_messages(messages: list[dict]) -> list[dict]:
++    """Convert only transport details, retaining thinking and tool history."""
++    result, names = [], {}
++    for message in copy.deepcopy(messages):
++        for call in message.get("tool_calls", []):
++            names[call.get("id", "")] = call["function"]["name"]
++            arguments = call["function"].get("arguments", {})
++            if isinstance(arguments, str):
++                call["function"]["arguments"] = json.loads(arguments)
++        if message.get("role") == "tool":
++            message["tool_name"] = names.get(message.pop("tool_call_id", ""), "")
++        result.append(message)
++    return result
++
++
++def ollama_completion(messages, tools, config, endpoint) -> dict:
++    """Adapt native Ollama tools; explicitly size context for the desktop manifest."""
++    protected = {"model", "messages", "tools", "stream", "options", "keep_alive"}
++    if protected.intersection(config.brain_extra):
++        raise ProviderError("brain.extra conflicts with managed Ollama request fields")
++    payload = {"model": endpoint.model, "messages": ollama_messages(messages), "tools": tools,
++               "stream": False, "keep_alive": config.brain_keep_alive,
++               "options": {"num_ctx": config.brain_context}, **config.brain_extra}
++    data = request_json(ollama_root(config) + "/api/chat", payload,
++                        key_headers(endpoint.key_env, required=bool(endpoint.key_env)), config.brain_timeout)
++    message = data.get("message")
++    if not isinstance(message, dict):
++        raise ProviderError("Ollama did not return an assistant message")
++    for index, call in enumerate(message.get("tool_calls") or []):
++        call.setdefault("id", f"ollama_{len(messages)}_{index}")
++        call.setdefault("type", "function")
++        if isinstance(call.get("function", {}).get("arguments"), dict):
++            call["function"]["arguments"] = json.dumps(call["function"]["arguments"])
++    return {"choices": [{"message": message}], "usage": {
++        "prompt_tokens": data.get("prompt_eval_count", 0), "completion_tokens": data.get("eval_count", 0)}}
+diff --git a/src/omarchy_voice/setup.py b/src/omarchy_voice/setup.py
+new file mode 100644
+index 0000000..ed0f86c
+--- /dev/null
++++ b/src/omarchy_voice/setup.py
+@@ -0,0 +1,214 @@
++"""Interactive provider setup; preserve settings, back up files and isolate secrets."""
++
++from __future__ import annotations
++
++import copy
++import dataclasses
++import getpass
++import json
++import os
++import re
++import sys
++import tempfile
++import time
++import tomllib
++from pathlib import Path
++
++from . import config as cfg
++from .models import manage, native_command
++from .providers import BRAIN_PRESETS, ProviderError, checked_url
++
++
++def toml_value(value) -> str:
++    """Encode configuration values, not executable Python or shell strings."""
++    if isinstance(value, str):
++        return json.dumps(value, ensure_ascii=False)
++    if isinstance(value, bool):
++        return "true" if value else "false"
++    if isinstance(value, (int, float)):
++        return repr(value)
++    if isinstance(value, list):
++        return "[" + ", ".join(toml_value(item) for item in value) + "]"
++    if hasattr(value, "isoformat"):
++        return value.isoformat()
++    raise ProviderError(f"Cannot preserve TOML value of type {type(value).__name__}")
++
++
++def dump_toml(data: dict, prefix: tuple[str, ...] = ()) -> str:
++    """Serialize parsed TOML; values survive, comments are kept in the backup."""
++    lines = []
