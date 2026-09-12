@@ -1,0 +1,34 @@
+name: Tests
+
+on:
+  pull_request:
+  push:
+    branches: [main, feat/local-voice-pipeline]
+
+permissions:
+  contents: read
+
+jobs:
+  unittest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Test
+        run: PYTHONPATH=src python -m unittest discover -s tests -v
+      - name: Source snapshot for reproducible offline validation
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: source-snapshot
+          path: |
+            src/
+            tests/
+            bin/
+            share/
+            install.sh
+            README.md
+            LICENSE
+          retention-days: 3
