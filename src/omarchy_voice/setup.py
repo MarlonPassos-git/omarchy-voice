@@ -1,0 +1,214 @@
+"""Interactive provider setup; preserve settings, back up files and isolate secrets."""
+
+from __future__ import annotations
+
+import copy
+import dataclasses
+import getpass
+import json
+import os
+import re
+import sys
+import tempfile
+import time
+import tomllib
+from pathlib import Path
+
+from . import config as cfg
+from .models import manage, native_command
+from .providers import BRAIN_PRESETS, ProviderError, checked_url
+
+
+def toml_value(value) -> str:
+    """Encode configuration values, not executable Python or shell strings."""
+    if isinstance(value, str):
+        return json.dumps(value, ensure_ascii=False)
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return repr(value)
+    if isinstance(value, list):
+        return "[" + ", ".join(toml_value(item) for item in value) + "]"
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    raise ProviderError(f"Cannot preserve TOML value of type {type(value).__name__}")
+
+
+def dump_toml(data: dict, prefix: tuple[str, ...] = ()) -> str:
+    """Serialize parsed TOML; values survive, comments are kept in the backup."""
+    lines = []
+    if prefix:
+        lines.append("[" + ".".join(json.dumps(part) for part in prefix) + "]")
+    lines.extend(f"{json.dumps(key)} = {toml_value(value)}" for key, value in data.items()
+                 if not isinstance(value, dict))
+    for key, value in data.items():
+        if isinstance(value, dict):
+            lines.extend(["", dump_toml(value, (*prefix, key))])
+    return "\n".join(lines) + "\n"
+
+
+def merged_settings(existing: dict, updates: dict) -> dict:
+    """Replace managed aliases, retaining unrelated and security settings."""
+    data = copy.deepcopy(existing)
+    for section, values in updates.items():
+        prefix = {"ears": "stt", "mouth": "tts"}.get(section, section)
+        canonical = {f"{prefix}_{key}" if prefix in cfg.PREFIXED_SECTIONS else key for key in values}
+        for key in canonical:
+            data.pop(key, None)
+        for name, table in data.items():
+            if not isinstance(table, dict):
+                continue
+            for key in list(table):
+                alias = f"{name}_{key}" if name in cfg.PREFIXED_SECTIONS else key
+                if name in {"ears", "mouth"}:
+                    proposed = f"{'stt' if name == 'ears' else 'tts'}_{key}"
+                    alias = proposed if proposed in cfg.Config.__dataclass_fields__ else key
+                if alias in canonical:
+                    del table[key]
+        if section in data and not isinstance(data[section], dict):
+            raise ProviderError(f"Existing {section!r} must be a TOML table")
+        data.setdefault(section, {}).update(values)
+    return data
+
+
+def atomic_private(path: Path, content: str) -> None:
+    """Write mode 600 atomically and keep an owner-only timestamped backup."""
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if path.is_symlink():
+        raise ProviderError(f"Refusing to replace symlink: {path}")
+    if path.exists():
+        backup = path.with_name(path.name + f".bak-{time.time_ns()}")
+        descriptor = os.open(backup, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(descriptor, "wb") as file:
+            file.write(path.read_bytes())
+    descriptor, name = tempfile.mkstemp(prefix=".setup-", dir=path.parent)
+    try:
+        with os.fdopen(descriptor, "w") as file:
+            file.write(content)
+        os.replace(name, path)
+    finally:
+        Path(name).unlink(missing_ok=True)
+
+
+def save_settings(path: Path, updates: dict) -> None:
+    """Validate a complete round trip before touching an existing configuration."""
+    existing = tomllib.loads(path.read_text()) if path.exists() else {}
+    content = dump_toml(merged_settings(existing, updates))
+    tomllib.loads(content)
+    atomic_private(path, content)
+
+
+def save_secrets(path: Path, secrets: dict[str, str]) -> None:
+    """Keep credentials in the private systemd environment file, not config.toml."""
+    if not secrets:
+        return
+    for name, value in secrets.items():
+        if not re.fullmatch(r"[A-Z_][A-Z0-9_]*", name) or not re.fullmatch(r"[A-Za-z0-9_.:/+=-]+", value):
+            raise ProviderError("Use an uppercase environment name and a single-line API token")
+    lines = path.read_text().splitlines() if path.exists() else []
+    lines = [line for line in lines if line.partition("=")[0].strip() not in secrets]
+    lines.extend(f"{name}={value}" for name, value in secrets.items())
+    atomic_private(path, "\n".join(lines) + "\n")
+
+
+def ask(label: str, default: str = "") -> str:
+    """Prompt without hiding which defaults will be saved."""
+    answer = input(f"{label}" + (f" [{default}]" if default else "") + ": ").strip()
+    return answer or default
+
+
+def choose(label: str, choices: tuple[str, ...], default: str) -> str:
+    """Require an explicit supported choice rather than silently falling back."""
+    while True:
+        answer = ask(f"{label} ({'/'.join(choices)})", default)
+        if answer in choices:
+            return answer
+        print("Choose one of the displayed options.")
+
+
+def credential(default: str, secrets: dict) -> str:
+    """A blank secret keeps the existing environment value; never echo it."""
+    name = ask("API key environment variable (use '-' for no authentication)", default)
+    if name == "-":
+        return ""
+    if not re.fullmatch(r"[A-Z_][A-Z0-9_]*", name):
+        raise ProviderError("Invalid API key environment variable")
+    token = getpass.getpass(f"{name} (blank keeps existing value): ").strip()
+    if token:
+        secrets[name] = token
+    return name
+
+
+def pipeline_choices(config, secrets: dict) -> dict:
+    """Select ears, brain and mouth independently; reuse existing Voxtype."""
+    ears = choose("Ears / ouvido", ("voxtype", "openai", "compatible"), "voxtype")
+    ear = {"provider": ears}
+    if ears != "voxtype":
+        ear.update(base_url=checked_url(ask("STT base URL", "https://api.openai.com/v1" if ears == "openai" else "")),
+                   model=ask("STT model", "gpt-4o-mini-transcribe"),
+                   api_key_env=credential("OPENAI_API_KEY" if ears == "openai" else "STT_API_KEY", secrets))
+    print("Voxtype keeps its own model and post-processing configuration; verify whether it uses a remote service.")
+    brain = choose("Brain / cerebro", tuple(BRAIN_PRESETS), "ollama")
+    url, env = BRAIN_PRESETS[brain]
+    default_model = {"ollama": "qwen3:4b", "openai": config.planner_model}.get(brain, "")
+    model = ask("Tool-capable text model ID", default_model)
+    if not model:
+        raise ProviderError("Choose an explicit text model ID")
+    head = {"provider": brain, "model": model, "base_url": checked_url(ask("Brain base URL", url)),
+            "api_key_env": credential(env or "-", secrets)}
+    mouth = choose("Mouth / voz", ("piper", "none", "openai", "elevenlabs", "compatible"), "piper")
+    voice = {"provider": mouth}
+    if mouth == "piper":
+        voice.update(voice=ask("Piper catalog voice", "pt_BR-faber-medium"), model="", device="cpu",
+                     python=ask("Python executable with piper-tts", config.tts_python),
+                     idle_seconds=300)
+    elif mouth != "none":
+        base = {"openai": "https://api.openai.com/v1", "elevenlabs": "https://api.elevenlabs.io/v1"}.get(mouth, "")
+        voice.update(base_url=checked_url(ask("TTS base URL", base)),
+                     model=ask("TTS model", "eleven_multilingual_v2" if mouth == "elevenlabs" else "gpt-4o-mini-tts"),
+                     voice=ask("Voice ID", "alloy" if mouth == "openai" else ""),
+                     api_key_env=credential("ELEVENLABS_API_KEY" if mouth == "elevenlabs" else "OPENAI_API_KEY" if mouth == "openai" else "TTS_API_KEY", secrets))
+    storage = {"models_dir": str(Path(ask("Local Piper models directory", config.models_dir)).expanduser().absolute())}
+    return {"voice": {"mode": "pipeline"}, "ears": ear, "brain": head, "mouth": voice, "storage": storage}
+
+
+def run(path: Path | None, config) -> int:
+    """Guide setup; installation/downloads are separate, opt-in operations."""
+    path = path or cfg.CONFIG_FILE
+    print("Omarchy Voice — integrated Realtime or ears -> brain -> mouth")
+    print("Existing settings are preserved; TOML comments stay in timestamped backups.")
+    mode = choose("Mode", ("realtime", "pipeline"), "pipeline")
+    secrets = {}
+    updates = pipeline_choices(config, secrets) if mode == "pipeline" else {"voice": {"mode": "realtime"}}
+    if mode == "realtime":
+        updates["realtime"] = {"model": ask("OpenAI Realtime model", config.realtime_model),
+                               "voice": ask("Realtime voice", config.realtime_voice)}
+        name = credential(config.api_key_env, secrets)
+        updates["openai"] = {"api_key_env": name or config.api_key_env}
+    print("\nSelected configuration (credentials are not shown):\n" + dump_toml(updates))
+    print("Remote ears send audio; a remote brain receives text/tool results; a remote mouth receives reply text.")
+    if choose("Save configuration?", ("yes", "no"), "yes") != "yes":
+        return 0
+    save_secrets(cfg.ENV_FILE, secrets)
+    save_settings(path, updates)
+    updated = cfg.load(path)
+    print(f"Saved {path}. Restart the voice user service after setup.")
+    if mode == "pipeline" and updated.tts_provider == "piper":
+        prepare_piper(path, updated)
+    if mode == "pipeline" and updated.brain_provider == "ollama":
+        if choose("Download selected Ollama model on its server?", ("yes", "no"), "no") == "yes":
+            print(manage(updated, "download", "brain"))
+    return 0
+
+
+def prepare_piper(path: Path, config) -> None:
+    """Optionally install Piper in an isolated user venv, then download its voice."""
+    if choose("Create isolated Piper runtime and install piper-tts from PyPI?", ("yes", "no"), "no") == "yes":
+        runtime = Path(config.models_dir).expanduser().parent / "runtime" / "piper"
+        native_command([sys.executable, "-m", "venv", str(runtime)])
+        python = str(runtime / "bin" / "python")
+        native_command([python, "-m", "pip", "install", "piper-tts"])
+        save_settings(path, {"mouth": {"python": python}})
+        config = dataclasses.replace(config, tts_python=python)
+    if choose("Download selected Piper voice from its model catalog?", ("yes", "no"), "no") == "yes":
+        print(manage(config, "download", "mouth"))

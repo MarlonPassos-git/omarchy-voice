@@ -251,7 +251,8 @@ class RealtimeSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("response.cancel", kinds)
         self.assertNotIn("conversation.item.truncate", kinds)
 
-    async def test_audio_bytes_reset_between_items(self):
+    @mock.patch.object(realtime.Speaker, "write", new_callable=mock.AsyncMock)
+    async def test_audio_bytes_reset_between_items(self, _write):
         """Truncation is an offset into one item, so bytes cannot accumulate.
 
         Carrying a running total across items asked the server to cut past the
@@ -702,12 +703,18 @@ class EchoGateTests(unittest.TestCase):
     def setUp(self):
         self.speaker = realtime.Speaker(rate=24000)
 
+    @staticmethod
+    def _unused_task(coroutine):
+        # These tests measure bookkeeping only, not PipeWire playback.
+        coroutine.close()
+        return mock.Mock(done=lambda: False)
+
     def test_a_fresh_speaker_is_not_playing(self):
         self.assertFalse(self.speaker.is_playing())
 
     def test_writing_audio_books_its_real_duration(self):
         """PCM16 mono: one second of 24 kHz is 48000 bytes."""
-        with mock.patch.object(realtime.asyncio, "create_task"):
+        with mock.patch.object(realtime.asyncio, "create_task", side_effect=self._unused_task):
             asyncio.run(self.speaker.write(b"\0" * 48000))
         self.assertTrue(self.speaker.is_playing())
         self.assertAlmostEqual(self.speaker._plays_until - time.monotonic(), 1.0, delta=0.2)
@@ -715,7 +722,7 @@ class EchoGateTests(unittest.TestCase):
     def test_chunks_queue_up_rather_than_overwriting_each_other(self):
         """The model sends a reply far faster than it is spoken, so the gate
         has to track the whole backlog, not the newest chunk."""
-        with mock.patch.object(realtime.asyncio, "create_task"):
+        with mock.patch.object(realtime.asyncio, "create_task", side_effect=self._unused_task):
             for _ in range(3):
                 asyncio.run(self.speaker.write(b"\0" * 24000))   # 0.5s each
         self.assertAlmostEqual(self.speaker._plays_until - time.monotonic(), 1.5, delta=0.3)
@@ -729,7 +736,7 @@ class EchoGateTests(unittest.TestCase):
     def test_a_barge_in_reopens_the_microphone_at_once(self):
         """Dropping queued audio means nothing more is coming out, so the gate
         must not stay shut for audio that will never be played."""
-        with mock.patch.object(realtime.asyncio, "create_task"):
+        with mock.patch.object(realtime.asyncio, "create_task", side_effect=self._unused_task):
             asyncio.run(self.speaker.write(b"\0" * 480000))       # 10 seconds
         self.assertTrue(self.speaker.is_playing())
         self.speaker._drop_queued()

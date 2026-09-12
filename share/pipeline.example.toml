@@ -1,0 +1,40 @@
+# Copy settings with `omarchy-voice setup`; this file is a fully local example.
+# Locality also depends on Voxtype's own engine/post-processing configuration.
+# Existing tools such as web_search can still intentionally open network pages.
+# models_dir = "/home/you/.local/share/omarchy-voice/models"
+
+[voice]
+mode = "pipeline"
+max_record_seconds = 30
+log_transcripts = false
+
+[ears]
+provider = "voxtype"
+binary = "voxtype"
+timeout = 60
+# Voxtype keeps its already-configured model, mic and model directory.
+
+[brain]
+provider = "ollama"
+base_url = "http://127.0.0.1:11434/v1"
+model = "qwen3:4b"
+api_key_env = ""
+context = 16384
+keep_alive = "5m"
+timeout = 120
+# Provider-specific optional parameters, never tools/messages/model overrides:
+# [brain.extra]
+# think = false
+
+[mouth]
+provider = "piper"
+voice = "pt_BR-faber-medium"
+# Set by setup when creating the optional isolated Piper runtime:
+python = "python3"
+device = "cpu"
+idle_seconds = 300
+notify = true
+
+[hands]
+allow_shell = false
+# Existing deny/confirmation defaults are retained, not replaced.

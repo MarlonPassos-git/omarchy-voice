@@ -33,7 +33,7 @@ pacman_install() {
 }
 
 bold "omarchy-voice installer"
-echo "OpenAI Realtime speech-to-speech, driving Omarchy."
+echo "Realtime or configurable ears -> brain -> mouth, driving Omarchy."
 echo
 
 # --- sanity ----------------------------------------------------------------
@@ -72,7 +72,7 @@ if [[ ! -f "$ENVFILE" ]]; then
 # OPENAI_API_KEY=sk-...
 EOF
   chmod 600 "$ENVFILE"
-  echo "   wrote $ENVFILE (mode 600) — put OPENAI_API_KEY here"
+  echo "   wrote $ENVFILE (mode 600) — setup stores only the selected provider keys"
 else
   chmod 600 "$ENVFILE" 2>/dev/null || true
   echo "   kept your existing $ENVFILE"
@@ -83,27 +83,29 @@ case ":$PATH:" in
   *) warn "$BINDIR is not on your PATH — add it, or the keybindings will not work." ;;
 esac
 
-# --- realtime --------------------------------------------------------------
+# --- providers -------------------------------------------------------------
 echo
-step "OpenAI Realtime"
-if python3 -c "import websockets" 2>/dev/null; then
-  echo "   python-websockets already installed"
-elif ask "install python-websockets with pacman?"; then
-  pacman_install python-websockets \
-    || warn "not installed — the daemon cannot connect without it"
-else
-  warn "skipped — the daemon cannot connect without it"
+step "provider setup"
+if ask "choose voice mode and providers now?"; then
+  "$BINDIR/omarchy-voice" setup || warn "setup was not completed; run omarchy-voice setup later"
 fi
-
-if grep -q "^OPENAI_API_KEY=.\+" "$ENVFILE" 2>/dev/null || [[ -n "${OPENAI_API_KEY:-}" ]]; then
-  echo "   OPENAI_API_KEY is set"
+MODE=$(PYTHONPATH="$PREFIX/src" python3 -c 'from omarchy_voice.config import load; print(load().voice_mode)')
+if [[ "$MODE" == "realtime" ]]; then
+  step "OpenAI Realtime dependencies"
+  if python3 -c "import websockets" 2>/dev/null; then
+    echo "   python-websockets already installed"
+  elif ask "install python-websockets with pacman?"; then
+    pacman_install python-websockets || warn "not installed — Realtime needs it"
+  else
+    warn "skipped — Realtime needs python-websockets"
+  fi
+  warn "Realtime sends room audio to OpenAI while listening is on."
+  warn "Configure its API key with omarchy-voice setup."
 else
-  warn "OPENAI_API_KEY is not set. Put it in $ENVFILE as"
-  warn "OPENAI_API_KEY=sk-... — a key exported in your shell does not reach"
-  warn "the systemd user service."
+  echo "   pipeline mode: no OpenAI key or websockets required for local providers"
+  echo "   reuses Voxtype; manage optional models with omarchy-voice models"
 fi
-warn "while listening is on, room audio streams continuously to OpenAI."
-warn "Toggling off stops the recorder, so nothing is captured while muted."
+echo "   Check selected dependencies: omarchy-voice doctor"
 
 # --- desktop integration ---------------------------------------------------
 echo

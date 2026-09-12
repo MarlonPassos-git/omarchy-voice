@@ -17,6 +17,8 @@ BarWidget {
     "idle":      "󰍬",
     "listening": "󰍬",
     "thinking":  "󱚟",
+    "transcribing": "󱚟",
+    "speaking": "󰕾",
     "acting":    "󱐋",
     "confirm":   "󰀦",
     "error":     "󰍭",
@@ -55,6 +57,7 @@ BarWidget {
     text: root.icons[root.status] || root.icons["idle"]
     active: root.status === "listening" || root.status === "thinking"
              || root.status === "acting" || root.status === "confirm"
+             || root.status === "transcribing" || root.status === "speaking"
     tooltipText: root.label !== ""
                  ? root.status + " — " + root.label
                  : "Voice control: " + root.status

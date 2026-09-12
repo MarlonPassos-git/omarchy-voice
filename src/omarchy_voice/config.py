@@ -117,7 +117,7 @@ RETIRED_KEYS = {
 
 # Sections whose keys are namespaced rather than flattened, because the plain
 # names are already taken by another section.
-PREFIXED_SECTIONS = {"realtime"}
+PREFIXED_SECTIONS = {"realtime", "voice", "brain", "stt", "tts"}
 
 # List-valued policy keys union with the built-in lists unless the matching
 # `*_replace` flag is set. Unknown keys are kept so doctor can report typos.
@@ -129,6 +129,37 @@ LIST_UNION_KEYS = {
 
 @dataclass
 class Config:
+    # --- interchangeable voice pipeline -----------------------------------
+    voice_mode: str = "realtime"  # realtime | pipeline
+    voice_max_record_seconds: float = 30.0
+    voice_log_transcripts: bool = False
+    brain_provider: str = "openai"
+    brain_base_url: str = ""
+    brain_model: str = ""  # empty preserves planner_model / --model
+    brain_api_key_env: str = ""
+    brain_context: int = 16384
+    brain_keep_alive: str = "5m"
+    brain_timeout: float = 60.0
+    brain_extra: dict = field(default_factory=dict)
+    stt_provider: str = "voxtype"
+    stt_binary: str = "voxtype"
+    stt_base_url: str = ""
+    stt_api_key_env: str = ""
+    stt_model: str = "gpt-4o-mini-transcribe"
+    stt_language: str = ""
+    stt_timeout: float = 60.0
+    tts_provider: str = "none"
+    tts_base_url: str = ""
+    tts_api_key_env: str = ""
+    tts_model: str = ""
+    tts_voice: str = "pt_BR-faber-medium"
+    tts_python: str = sys.executable
+    tts_device: str = "cpu"
+    tts_timeout: float = 60.0
+    tts_idle_seconds: float = 300.0
+    models_dir: str = str(Path(os.environ.get(
+        "XDG_DATA_HOME", Path.home() / ".local/share")) / "omarchy-voice/models")
+
     # --- openai ------------------------------------------------------------
     planner_model: str = "gpt-4.1"
     api_key_env: str = "OPENAI_API_KEY"
@@ -203,7 +234,15 @@ def load(path: Path | None = None, **overrides) -> Config:
         for key, value in raw.items():
             if isinstance(value, dict):
                 prefix = f"{key}_" if key in PREFIXED_SECTIONS else ""
-                data.update({f"{prefix}{k}": v for k, v in value.items()})
+                for k, v in value.items():
+                    # Friendly aliases without changing legacy ears.device,
+                    # ears.mode, mouth.notify/speak/tts_command semantics.
+                    if key == "ears" and f"stt_{k}" in Config.__dataclass_fields__:
+                        data[f"stt_{k}"] = v
+                    elif key == "mouth" and f"tts_{k}" in Config.__dataclass_fields__:
+                        data[f"tts_{k}"] = v
+                    else:
+                        data[f"{prefix}{k}"] = v
             else:
                 data[key] = value
 
