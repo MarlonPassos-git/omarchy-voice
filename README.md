@@ -1,5 +1,33 @@
 # omarchy-voice
 
+## Local and hybrid voice pipeline
+
+This fork supports the original **OpenAI Realtime** mode and a new modular
+**ears → brain → mouth** mode. Run `omarchy-voice setup` to choose providers;
+existing configurations keep Realtime by default.
+
+```text
+Voxtype (existing STT) → Ollama / OpenAI / Gemini / OpenRouter / compatible LLM
+                      → original desktop tools + policy gate
+                      → local Piper / speech API / text-only notification
+```
+
+The setup wizard offers optional model downloads, an isolated Piper runtime,
+independent API credentials, and private configuration backups. `omarchy-voice
+models` manages the selected local models explicitly. No OpenAI key is required
+when all selected providers are local.
+
+Pipeline uses the existing shortcut as **record → submit** (two presses), not
+full-duplex Realtime. F9 remains Voxtype's normal dictation shortcut. Do not use
+both simultaneously because they share the recorder. Verify Voxtype's own engine
+and post-processing settings before treating this as fully offline.
+
+See **[provider setup, configuration and limitations](docs/PROVIDERS.md)** and
+[the local example](share/pipeline.example.toml). The upstream guide below
+continues to describe the original integrated Realtime experience.
+
+---
+
 Operate Omarchy by talking to it. Speech goes to OpenAI Realtime; the only
 thing that runs on this machine is the policy gate and the Omarchy / Hyprland
 tools.

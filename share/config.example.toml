@@ -1,5 +1,10 @@
 # ~/.config/omarchy-voice/config.toml
 # Every key here is optional — these are the defaults.
+# Run `omarchy-voice setup` to select the modular local/hybrid pipeline.
+# See share/pipeline.example.toml and docs/PROVIDERS.md.
+
+[voice]
+mode = "realtime"
 
 [openai]
 # Used by `omarchy-voice say` (typed, no microphone). The daemon itself talks
@@ -49,5 +54,6 @@ cancel_words = ["cancel", "never mind", "nevermind"]
 
 [mouth]
 notify = true
-speak  = false            # needs piper or espeak-ng
+speak  = false            # legacy feedback setting; pipeline uses provider instead
+# provider = "none"      # pipeline: piper | openai | elevenlabs | compatible | none
 # tts_command = "piper-say"

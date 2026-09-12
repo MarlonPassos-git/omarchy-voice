@@ -1,8 +1,0 @@
-     def test_a_barge_in_reopens_the_microphone_at_once(self):
-         """Dropping queued audio means nothing more is coming out, so the gate
-         must not stay shut for audio that will never be played."""
--        with mock.patch.object(realtime.asyncio, "create_task"):
-+        with mock.patch.object(realtime.asyncio, "create_task", side_effect=self._unused_task):
-             asyncio.run(self.speaker.write(b"\0" * 480000))       # 10 seconds
-         self.assertTrue(self.speaker.is_playing())
-         self.speaker._drop_queued()

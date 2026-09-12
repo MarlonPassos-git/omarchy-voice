@@ -13,6 +13,7 @@ from pathlib import Path
 
 from . import __version__, capabilities, config as cfg, realtime as realtime_mod
 from .planner import Planner
+from .providers import ProviderError
 from .session import daemon_running, send_control
 from .tools import Executor
 
@@ -60,6 +61,11 @@ def cmd_say(args, config) -> int:
 
 
 def cmd_run(args, config) -> int:
+    if config.voice_mode == "pipeline":
+        from .pipeline import run
+        return run(config)
+    if config.voice_mode != "realtime":
+        raise ProviderError("voice.mode must be realtime or pipeline")
     return realtime_mod.run(config)
 
 
@@ -106,6 +112,8 @@ def cmd_manifest(args, config) -> int:
 
 
 def cmd_doctor(args, config) -> int:
+    if config.voice_mode == "pipeline":
+        return cmd_pipeline_doctor(args, config)
     print(_bold(f"omarchy-voice {__version__}\n"))
 
     print(_bold("openai"))
@@ -201,12 +209,65 @@ def cmd_log(args, config) -> int:
     return 0
 
 
+def cmd_pipeline_doctor(args, config) -> int:
+    """Report selected dependencies and routing, without sending data to APIs."""
+    from .pipeline import check_ready
+    from .providers import brain_endpoint
+    problems = check_ready(config)
+    print(_bold("Omarchy Voice — ears -> brain -> mouth"))
+    print(f"  ears:  {config.stt_provider}")
+    try:
+        endpoint = brain_endpoint(config)
+        print(f"  brain: {config.brain_provider}, {endpoint.model} at {endpoint.base_url}")
+    except ProviderError:
+        pass
+    print(f"  mouth: {config.tts_provider}; models: {config.models_dir}")
+    print("  Toggle once to record, again to submit. Stop/cancel discards the command.")
+    print("  Voxtype inherits its own local/remote and post-processing settings.")
+    print("  Remote ears receive audio; remote brains receive text/tool results;")
+    print("  remote mouths receive reply text. No automatic provider fallback.")
+    for name in ("hyprctl", "omarchy", "wtype", "uwsm-app"):
+        print(f"  {_tick(bool(shutil.which(name)))} {name}")
+    if config.unknown_keys:
+        problems.append("unknown config keys: " + ", ".join(config.unknown_keys))
+    for problem in problems:
+        print(f"  {_tick(False)} {problem}")
+    if not problems:
+        print("  ✓ selected dependencies found (model/API inference not tested)")
+    print(f"  shell: {'enabled' if config.allow_shell else 'disabled'}; local confirmation required")
+    return 1 if problems else 0
+
+
+def cmd_setup(args, config) -> int:
+    from .setup import run
+    if not sys.stdin.isatty():
+        raise ProviderError("setup needs an interactive terminal")
+    return run(args.config, config)
+
+
+def cmd_models(args, config) -> int:
+    from .models import manage
+    print(manage(config, args.action, args.target))
+    return 0
+
+
+def cmd_speak(args, config) -> int:
+    """Test only the mouth: never ask a model to run desktop tools."""
+    from .speech import Mouth
+    mouth = Mouth(config)
+    try:
+        mouth.speak(" ".join(args.text))
+        return 0
+    finally:
+        mouth.close()
+
+
 # --- parser -----------------------------------------------------------------
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="omarchy-voice",
-        description="Drive Omarchy by voice, with OpenAI Realtime as the router.",
+        description="Drive Omarchy with Realtime or a configurable ears/brain/mouth pipeline.",
     )
     parser.add_argument("--version", action="version", version=f"omarchy-voice {__version__}")
     parser.add_argument("-n", "--dry-run", action="store_true",
@@ -248,6 +309,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("-f", "--follow", action="store_true")
     p.set_defaults(func=cmd_log)
 
+    p = sub.add_parser("setup", help="choose integrated voice or ears/brain/mouth providers")
+    p.set_defaults(func=cmd_setup)
+    p = sub.add_parser("models", help="explicit model downloads and lifecycle controls")
+    p.add_argument("action", choices=("list", "download", "load", "unload"))
+    p.add_argument("target", choices=("ears", "brain", "mouth"))
+    p.set_defaults(func=cmd_models)
+    p = sub.add_parser("speak", help="test the configured mouth without desktop actions")
+    p.add_argument("text", nargs="+")
+    p.set_defaults(func=cmd_speak)
     return parser
 
 
@@ -257,13 +327,18 @@ def main(argv: list[str] | None = None) -> int:
     env_warnings = cfg.load_env_file()
     if args.command == "doctor":
         cfg.warn_env_permissions(env_warnings)
-    config = cfg.load(
-        args.config,
-        dry_run=args.dry_run or None,
-        verbose=args.verbose or None,
-        planner_model=getattr(args, "model", None),
-    )
-    return args.func(args, config)
+    try:
+        config = cfg.load(
+            args.config, dry_run=args.dry_run or None, verbose=args.verbose or None,
+            planner_model=getattr(args, "model", None), brain_model=getattr(args, "model", None),
+        )
+        return args.func(args, config)
+    except (ProviderError, OSError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    except (KeyboardInterrupt, EOFError):
+        print("Cancelled.", file=sys.stderr)
+        return 130
 
 
 if __name__ == "__main__":

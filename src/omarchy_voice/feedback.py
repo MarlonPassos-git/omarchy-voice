@@ -21,6 +21,8 @@ ICONS = {
     "idle": "󰍬",
     "listening": "󰍬",
     "thinking": "󱚟",
+    "transcribing": "󰍬",
+    "speaking": "󰕾",
     "acting": "󱐋",
     "confirm": "󰀦",
     "error": "󰍭",

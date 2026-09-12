@@ -1,0 +1,9 @@
+#!/bin/bash
+# omarchy:summary=Test speech output without desktop actions
+# omarchy:group=voice
+# omarchy:examples=omarchy voice speak
+set -euo pipefail
+# Use the module, not the omarchy-voice route wrapper, to avoid PATH recursion.
+SRC="${OMARCHY_VOICE_SRC:-$HOME/.local/share/omarchy-voice/src}"
+[[ -d $SRC ]] && export PYTHONPATH="$SRC${PYTHONPATH:+:$PYTHONPATH}"
+exec python3 -m omarchy_voice speak "$@"

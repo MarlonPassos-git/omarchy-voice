@@ -215,7 +215,9 @@ class DesktopActionTests(unittest.TestCase):
         self.config = Config(dry_run=False)
         self.executor = Executor(self.config)
 
-    def test_unknown_action_lists_the_real_ones(self):
+    @mock.patch("omarchy_voice.tools._desktop_entry_exists", return_value=True)
+    @mock.patch("omarchy_voice.tools.desktop_actions", return_value=["new-window"])
+    def test_unknown_action_lists_the_real_ones(self, _actions, _exists):
         result = self.executor.call("launch_app", {"app": "google-chrome:not-an-action"})
         self.assertFalse(result.ok)
         self.assertIn("new-window", result.output)
